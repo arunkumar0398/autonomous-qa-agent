@@ -1,6 +1,6 @@
-import Database from 'better-sqlite3';
-import { mkdirSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import initSqlJs from 'sql.js';
 import { Repository } from './repository.js';
 
 const MIGRATIONS = `
@@ -60,58 +60,145 @@ CREATE INDEX IF NOT EXISTS idx_pipeline_runs_run_id ON pipeline_runs(run_id);
 CREATE INDEX IF NOT EXISTS idx_pipeline_runs_status ON pipeline_runs(status);
 `;
 
+/**
+ * SQLite repository backed by sql.js (pure WASM, no native build required).
+ *
+ * For in-memory databases pass ':memory:' as the dbPath.
+ * For file-backed databases pass an absolute or relative path — the file is
+ * read on initialize() and written on every mutating operation.
+ */
 export class SqliteRepository extends Repository {
-  /** @param {string} dbPath */
+  /** @param {string} dbPath  ':memory:' or a file path */
   constructor(dbPath) {
     super();
-    this._dbPath = dbPath;
+    this._dbPath = dbPath === ':memory:' ? null : resolve(dbPath);
     this._db = null;
+    this._SQL = null;
   }
 
   async initialize() {
-    mkdirSync(dirname(this._dbPath), { recursive: true });
-    this._db = new Database(this._dbPath);
-    this._db.pragma('journal_mode = WAL');
-    this._db.pragma('busy_timeout = 5000');
-    this._db.exec(MIGRATIONS);
+    this._SQL = await initSqlJs();
+
+    if (this._dbPath) {
+      mkdirSync(dirname(this._dbPath), { recursive: true });
+      if (existsSync(this._dbPath)) {
+        const buf = readFileSync(this._dbPath);
+        this._db = new this._SQL.Database(buf);
+      } else {
+        this._db = new this._SQL.Database();
+      }
+    } else {
+      // In-memory
+      this._db = new this._SQL.Database();
+    }
+
+    this._db.run(MIGRATIONS);
   }
 
   async close() {
     if (this._db) {
+      this._persist();
       this._db.close();
       this._db = null;
     }
   }
 
+  /** Persist DB to file (no-op for in-memory). */
+  _persist() {
+    if (this._dbPath && this._db) {
+      const data = this._db.export();
+      writeFileSync(this._dbPath, Buffer.from(data));
+    }
+  }
+
+  /* ---- helpers ---- */
+
+  /**
+   * Execute a SELECT and return all rows as plain objects.
+   * @param {string} sql
+   * @param {object|Array} [params]
+   * @returns {object[]}
+   */
+  _all(sql, params = {}) {
+    const stmt = this._db.prepare(sql);
+    stmt.bind(params);
+    const rows = [];
+    while (stmt.step()) {
+      rows.push(stmt.getAsObject());
+    }
+    stmt.free();
+    return rows;
+  }
+
+  /**
+   * Execute a SELECT and return first row, or null.
+   * @param {string} sql
+   * @param {object|Array} [params]
+   * @returns {object|null}
+   */
+  _get(sql, params = {}) {
+    const stmt = this._db.prepare(sql);
+    stmt.bind(params);
+    const has = stmt.step();
+    const row = has ? stmt.getAsObject() : null;
+    stmt.free();
+    return row;
+  }
+
+  /**
+   * Execute a mutating statement (INSERT/UPDATE/DELETE).
+   * @param {string} sql
+   * @param {object|Array} [params]
+   * @returns {number} lastInsertRowid
+   */
+  _run(sql, params = {}) {
+    this._db.run(sql, params);
+    const [{ last_insert_rowid }] = this._db.exec('SELECT last_insert_rowid() as last_insert_rowid')[0]?.values?.map(
+      (v) => ({ last_insert_rowid: v[0] }),
+    ) ?? [{ last_insert_rowid: 0 }];
+    this._persist();
+    return last_insert_rowid;
+  }
+
+  _getScenarioById(id) {
+    const row = this._get('SELECT * FROM test_scenarios WHERE id = ?', [id]);
+    return row ? deserializeScenario(row) : null;
+  }
+
+  _getPipelineRunByRunId(runId) {
+    const row = this._get('SELECT * FROM pipeline_runs WHERE run_id = ?', [runId]);
+    return row ? deserializePipelineRun(row) : null;
+  }
+
   /* ---- test_scenarios ---- */
 
   async createScenario(scenario) {
-    const stmt = this._db.prepare(`
-      INSERT INTO test_scenarios (feature_id, scenario_name, description, priority, type, steps, status, tags)
-      VALUES (@featureId, @scenarioName, @description, @priority, @type, @steps, @status, @tags)
-    `);
-    const info = stmt.run({
-      featureId: scenario.featureId,
-      scenarioName: scenario.scenarioName,
-      description: scenario.description ?? null,
-      priority: scenario.priority ?? 'medium',
-      type: scenario.type ?? 'happy_path',
-      steps: JSON.stringify(scenario.steps),
-      status: scenario.status ?? 'active',
-      tags: scenario.tags ? JSON.stringify(scenario.tags) : null,
-    });
-    return this._getScenarioById(info.lastInsertRowid);
+    const id = this._run(
+      `INSERT INTO test_scenarios (feature_id, scenario_name, description, priority, type, steps, status, tags)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        scenario.featureId,
+        scenario.scenarioName,
+        scenario.description ?? null,
+        scenario.priority ?? 'medium',
+        scenario.type ?? 'happy_path',
+        JSON.stringify(scenario.steps),
+        scenario.status ?? 'active',
+        scenario.tags ? JSON.stringify(scenario.tags) : null,
+      ],
+    );
+    return this._getScenarioById(id);
   }
 
   async getScenariosByFeature(featureId) {
-    const rows = this._db
-      .prepare('SELECT * FROM test_scenarios WHERE feature_id = ? AND status = ?')
-      .all(featureId, 'active');
+    const rows = this._all(
+      "SELECT * FROM test_scenarios WHERE feature_id = ? AND status = 'active'",
+      [featureId],
+    );
     return rows.map(deserializeScenario);
   }
 
   async updateScenario(id, updates) {
-    const allowed = ['scenario_name', 'description', 'priority', 'type', 'steps', 'status', 'last_run', 'failure_count', 'tags'];
     const mapping = {
       scenarioName: 'scenario_name',
       description: 'description',
@@ -125,71 +212,78 @@ export class SqliteRepository extends Repository {
     };
 
     const sets = [];
-    const values = {};
+    const values = [];
     for (const [jsKey, dbCol] of Object.entries(mapping)) {
-      if (updates[jsKey] !== undefined && allowed.includes(dbCol)) {
+      if (updates[jsKey] !== undefined) {
         let val = updates[jsKey];
         if (dbCol === 'steps' || dbCol === 'tags') val = JSON.stringify(val);
-        sets.push(`${dbCol} = @${dbCol}`);
-        values[dbCol] = val;
+        sets.push(`${dbCol} = ?`);
+        values.push(val);
       }
     }
     if (sets.length === 0) return this._getScenarioById(id);
 
     sets.push("updated_at = datetime('now')");
-    values.id = id;
-    this._db.prepare(`UPDATE test_scenarios SET ${sets.join(', ')} WHERE id = @id`).run(values);
+    values.push(id);
+    this._run(`UPDATE test_scenarios SET ${sets.join(', ')} WHERE id = ?`, values);
     return this._getScenarioById(id);
   }
 
   async getAllScenarios() {
-    const rows = this._db.prepare('SELECT * FROM test_scenarios WHERE status = ?').all('active');
+    const rows = this._all("SELECT * FROM test_scenarios WHERE status = 'active'");
     return rows.map(deserializeScenario);
   }
 
   /* ---- execution_logs ---- */
 
   async createExecutionLog(log) {
-    const stmt = this._db.prepare(`
-      INSERT INTO execution_logs (scenario_id, status, screenshot_url, error_details, duration_ms)
-      VALUES (@scenarioId, @status, @screenshotUrl, @errorDetails, @durationMs)
-    `);
-    const info = stmt.run({
-      scenarioId: log.scenarioId,
-      status: log.status,
-      screenshotUrl: log.screenshotUrl ?? null,
-      errorDetails: log.errorDetails ? JSON.stringify(log.errorDetails) : null,
-      durationMs: log.durationMs ?? null,
-    });
-    return this._db.prepare('SELECT * FROM execution_logs WHERE id = ?').get(info.lastInsertRowid);
+    const id = this._run(
+      `INSERT INTO execution_logs (scenario_id, status, screenshot_url, error_details, duration_ms)
+       VALUES (?, ?, ?, ?, ?)`,
+      [
+        log.scenarioId,
+        log.status,
+        log.screenshotUrl ?? null,
+        log.errorDetails ? JSON.stringify(log.errorDetails) : null,
+        log.durationMs ?? null,
+      ],
+    );
+    return this._get('SELECT * FROM execution_logs WHERE id = ?', [id]);
   }
 
   async getExecutionLogs(scenarioId, limit = 20) {
-    return this._db
-      .prepare('SELECT * FROM execution_logs WHERE scenario_id = ? ORDER BY run_at DESC LIMIT ?')
-      .all(scenarioId, limit);
+    return this._all(
+      'SELECT * FROM execution_logs WHERE scenario_id = ? ORDER BY run_at DESC LIMIT ?',
+      [scenarioId, limit],
+    );
   }
 
   /* ---- world_model ---- */
 
   async upsertWorldModel(page) {
-    this._db.prepare(`
-      INSERT INTO world_model (page_url, elements, flows, last_updated)
-      VALUES (@pageUrl, @elements, @flows, datetime('now'))
-      ON CONFLICT(page_url) DO UPDATE SET
-        elements = @elements,
-        flows = @flows,
-        last_updated = datetime('now')
-    `).run({
-      pageUrl: page.pageUrl,
-      elements: page.elements ? JSON.stringify(page.elements) : null,
-      flows: page.flows ? JSON.stringify(page.flows) : null,
-    });
-    return this._db.prepare('SELECT * FROM world_model WHERE page_url = ?').get(page.pageUrl);
+    this._run(
+      `INSERT INTO world_model (page_url, elements, flows, last_updated)
+       VALUES (?, ?, ?, datetime('now'))
+       ON CONFLICT(page_url) DO UPDATE SET
+         elements = excluded.elements,
+         flows = excluded.flows,
+         last_updated = datetime('now')`,
+      [
+        page.pageUrl,
+        page.elements ? JSON.stringify(page.elements) : null,
+        page.flows ? JSON.stringify(page.flows) : null,
+      ],
+    );
+    const row = this._get('SELECT * FROM world_model WHERE page_url = ?', [page.pageUrl]);
+    return {
+      ...row,
+      elements: row.elements ? JSON.parse(row.elements) : null,
+      flows: row.flows ? JSON.parse(row.flows) : null,
+    };
   }
 
   async getWorldModel() {
-    const rows = this._db.prepare('SELECT * FROM world_model').all();
+    const rows = this._all('SELECT * FROM world_model');
     return rows.map((r) => ({
       ...r,
       elements: r.elements ? JSON.parse(r.elements) : null,
@@ -200,15 +294,16 @@ export class SqliteRepository extends Repository {
   /* ---- pipeline_runs ---- */
 
   async createPipelineRun(run) {
-    this._db.prepare(`
-      INSERT INTO pipeline_runs (run_id, trigger, status, options)
-      VALUES (@runId, @trigger, @status, @options)
-    `).run({
-      runId: run.runId,
-      trigger: run.trigger ?? 'api',
-      status: run.status ?? 'pending',
-      options: run.options ? JSON.stringify(run.options) : null,
-    });
+    this._run(
+      `INSERT INTO pipeline_runs (run_id, trigger, status, options)
+       VALUES (?, ?, ?, ?)`,
+      [
+        run.runId,
+        run.trigger ?? 'api',
+        run.status ?? 'pending',
+        run.options ? JSON.stringify(run.options) : null,
+      ],
+    );
     return this._getPipelineRunByRunId(run.runId);
   }
 
@@ -224,19 +319,19 @@ export class SqliteRepository extends Repository {
     };
 
     const sets = [];
-    const values = {};
+    const values = [];
     for (const [jsKey, dbCol] of Object.entries(mapping)) {
       if (updates[jsKey] !== undefined) {
         let val = updates[jsKey];
         if (dbCol === 'error_details' && val && typeof val === 'object') val = JSON.stringify(val);
-        sets.push(`${dbCol} = @${dbCol}`);
-        values[dbCol] = val;
+        sets.push(`${dbCol} = ?`);
+        values.push(val);
       }
     }
     if (sets.length === 0) return this._getPipelineRunByRunId(runId);
 
-    values.runId = runId;
-    this._db.prepare(`UPDATE pipeline_runs SET ${sets.join(', ')} WHERE run_id = @runId`).run(values);
+    values.push(runId);
+    this._run(`UPDATE pipeline_runs SET ${sets.join(', ')} WHERE run_id = ?`, values);
     return this._getPipelineRunByRunId(runId);
   }
 
@@ -245,22 +340,10 @@ export class SqliteRepository extends Repository {
   }
 
   async listPipelineRuns(limit = 20) {
-    return this._db
-      .prepare('SELECT * FROM pipeline_runs ORDER BY started_at DESC LIMIT ?')
-      .all(limit)
-      .map(deserializePipelineRun);
-  }
-
-  /* ---- helpers ---- */
-
-  _getScenarioById(id) {
-    const row = this._db.prepare('SELECT * FROM test_scenarios WHERE id = ?').get(id);
-    return row ? deserializeScenario(row) : null;
-  }
-
-  _getPipelineRunByRunId(runId) {
-    const row = this._db.prepare('SELECT * FROM pipeline_runs WHERE run_id = ?').get(runId);
-    return row ? deserializePipelineRun(row) : null;
+    return this._all(
+      'SELECT * FROM pipeline_runs ORDER BY started_at DESC LIMIT ?',
+      [limit],
+    ).map(deserializePipelineRun);
   }
 }
 
