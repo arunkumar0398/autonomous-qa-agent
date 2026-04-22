@@ -1,0 +1,26 @@
+{
+  "name": "testpilot-ai-autonomous-qa-agent",
+  "version": "0.1.0",
+  "description": "Autonomous QA agent orchestrator for MERN applications",
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "dev": "node --watch src/server.js",
+    "start": "node src/server.js",
+    "test": "node --test test/unit/db/sqlite.test.js test/unit/engines/prompt-builder.test.js test/unit/engines/playwright-runner.test.js test/integration/pipeline.test.js",
+    "test:unit": "node --test test/unit/db/sqlite.test.js test/unit/engines/prompt-builder.test.js test/unit/engines/playwright-runner.test.js",
+    "test:integration": "node --test test/integration/pipeline.test.js",
+    "check": "node --check src/server.js && node --check src/core/pipeline.js && node --check src/engines/discovery/git-diff.js && node --check src/engines/generator/index.js && node --check src/engines/executor/playwright-runner.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.36.3",
+    "@playwright/test": "^1.52.0",
+    "express": "^4.19.2",
+    "openai": "^6.34.0",
+    "simple-git": "^3.36.0",
+    "sql.js": "^1.14.1"
+  }
+}
