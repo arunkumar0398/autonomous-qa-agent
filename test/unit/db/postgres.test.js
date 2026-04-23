@@ -151,12 +151,14 @@ describe('PostgresRepository', { skip: skip ? SKIP_MSG : false }, () => {
   });
 
   describe('pipeline_runs', () => {
-    test('createPipelineRun — inserts run row', async () => {
+    test('createPipelineRun — inserts run row with JSONB options', async () => {
       const runId = `${prefix}run-001`;
-      const run = await db.createPipelineRun({ runId, trigger: 'api', status: 'running' });
+      const options = { parallel: true, retries: 2 };
+      const run = await db.createPipelineRun({ runId, trigger: 'api', status: 'running', options });
 
       assert.equal(run.run_id, runId);
       assert.equal(run.status, 'running');
+      assert.deepEqual(run.options, options);
     });
 
     test('updatePipelineRun — updates status and counts', async () => {
@@ -213,6 +215,7 @@ describe('PostgresRepository', { skip: skip ? SKIP_MSG : false }, () => {
       assert.ok(Array.isArray(row.elements), 'elements should be JS array');
       assert.equal(row.elements.length, 2);
       assert.ok(Array.isArray(row.flows), 'flows should be JS array');
+      assert.deepEqual(row.flows, ['login → dash']);
     });
 
     test('getWorldModel — returns array', async () => {
