@@ -86,9 +86,10 @@ function buildDescription(issue) {
  * @param {string} config.email
  * @param {string} config.apiToken
  * @param {string} config.project     - Jira project key
- * @param {string} [config.jql]       - custom JQL (overrides default)
- * @param {number} [config.maxResults] - defaults to 50
- * @returns {Promise<object[]>}       - raw Jira issue objects
+ * @param {string} [config.jql]        - custom JQL (overrides default)
+ * @param {number} [config.maxResults]  - defaults to 50
+ * @param {number} [config.timeoutMs]   - request timeout in ms (default 15 000)
+ * @returns {Promise<object[]>}        - raw Jira issue objects
  */
 async function fetchIssues(config) {
   const jql = config.jql ??
@@ -101,12 +102,21 @@ async function fetchIssues(config) {
 
   const token = Buffer.from(`${config.email}:${config.apiToken}`).toString('base64');
 
-  const res = await fetch(url.toString(), {
-    headers: {
-      Authorization: `Basic ${token}`,
-      Accept: 'application/json',
-    },
-  });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), config.timeoutMs ?? 15_000);
+
+  let res;
+  try {
+    res = await fetch(url.toString(), {
+      signal: controller.signal,
+      headers: {
+        Authorization: `Basic ${token}`,
+        Accept: 'application/json',
+      },
+    });
+  } finally {
+    clearTimeout(timer);
+  }
 
   if (!res.ok) {
     const body = await res.text();
@@ -151,6 +161,7 @@ function issueToFeature(issue) {
  * @param {string} [options.project]
  * @param {string} [options.jql]
  * @param {number} [options.maxResults]
+ * @param {number} [options.timeoutMs]   - HTTP fetch timeout in ms (default 15 000)
  * @returns {Promise<object[]>}
  */
 export async function discoverFromJira(options = {}) {
@@ -161,6 +172,7 @@ export async function discoverFromJira(options = {}) {
     project:    options.project    ?? process.env.TESTPILOT_JIRA_PROJECT,
     jql:        options.jql        ?? process.env.TESTPILOT_JIRA_JQL,
     maxResults: options.maxResults ?? Number(process.env.TESTPILOT_JIRA_MAX ?? 50),
+    timeoutMs:  options.timeoutMs  ?? 15_000,
   };
 
   // Skip silently when Jira is not configured
