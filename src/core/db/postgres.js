@@ -77,6 +77,10 @@ export class PostgresRepository extends Repository {
   }
 
   async initialize() {
+    // Idempotent: skip if already initialised so callers can call initialize()
+    // multiple times without leaking pool connections.
+    if (this._pool) return;
+
     this._pool = new Pool({
       connectionString: this._connectionString,
       max: this._poolOptions.max ?? 10,
@@ -87,7 +91,7 @@ export class PostgresRepository extends Repository {
     // Surface idle-client errors instead of crashing the process with an
     // unhandled 'error' event on the Pool EventEmitter.
     this._pool.on('error', (err) => {
-      console.error('[PostgresRepository] idle client error:', err.message);
+      console.error('[PostgresRepository] idle client error:', err);
     });
 
     // Run each DDL statement inside a single transaction so the schema is
@@ -99,9 +103,13 @@ export class PostgresRepository extends Repository {
         await client.query(stmt);
       }
       await client.query('COMMIT');
-    } catch (err) {
-      await client.query('ROLLBACK');
-      throw err;
+    } catch (migrationErr) {
+      // ROLLBACK failure must not mask the original migration error.
+      try { await client.query('ROLLBACK'); } catch { /* ignore */ }
+      // Tear down the pool so the instance is not left half-initialised.
+      await this._pool.end().catch(() => {});
+      this._pool = null;
+      throw migrationErr;
     } finally {
       client.release();
     }
@@ -161,7 +169,9 @@ export class PostgresRepository extends Repository {
   /* ---- test_scenarios ---- */
 
   async createScenario(scenario) {
-    // Pass JS values directly — pg serialises JSONB columns automatically.
+    // pg serialises plain objects to JSONB automatically, but binds JS arrays
+    // as Postgres array literals ({elem1,elem2}) rather than JSON ([…]).
+    // Explicitly JSON.stringify every array-valued JSONB column.
     return this._run(
       `INSERT INTO test_scenarios
          (feature_id, scenario_name, description, priority, type, steps, status, tags)
@@ -173,9 +183,9 @@ export class PostgresRepository extends Repository {
         scenario.description ?? null,
         scenario.priority ?? 'medium',
         scenario.type ?? 'happy_path',
-        scenario.steps ?? [],
+        JSON.stringify(scenario.steps ?? []),
         scenario.status ?? 'active',
-        scenario.tags ?? [],
+        JSON.stringify(scenario.tags ?? []),
       ],
     );
   }
@@ -206,9 +216,12 @@ export class PostgresRepository extends Repository {
 
     for (const [jsKey, dbCol] of Object.entries(mapping)) {
       if (updates[jsKey] !== undefined) {
-        // Pass JSONB columns as raw JS values — pg handles serialisation.
+        let val = updates[jsKey];
+        // steps and tags are JSONB array columns — stringify to avoid pg
+        // binding them as Postgres array literals instead of JSON.
+        if (dbCol === 'steps' || dbCol === 'tags') val = JSON.stringify(val);
         sets.push(`${dbCol} = $${idx++}`);
-        values.push(updates[jsKey]);
+        values.push(val);
       }
     }
     if (sets.length === 0) {
