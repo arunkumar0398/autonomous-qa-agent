@@ -16,12 +16,26 @@
  *   TESTPILOT_OPENAPI_BASE_SPEC   Path or URL to base spec (for diff mode)
  */
 
-import { readFileSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import yaml from 'js-yaml';
 
 /** HTTP methods that represent testable API operations. */
 const HTTP_METHODS = ['get', 'post', 'put', 'patch', 'delete', 'options', 'head'];
+
+/**
+ * Key-order-stable JSON serialisation for reliable equality checks.
+ * JSON.stringify is key-order-sensitive — two semantically identical objects
+ * built from different parsers can produce different strings.
+ * @param {unknown} value
+ * @returns {string}
+ */
+function stableStringify(value) {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
+  const keys = Object.keys(value).sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(value[k])}`).join(',')}}`;
+}
 
 /** Path segments that imply higher test priority. */
 const HIGH_PRIORITY_SEGMENTS = [
@@ -46,26 +60,47 @@ function inferPriority(apiPath, method) {
 
 /**
  * Load and parse a spec from a file path or URL.
- * @param {string} source  - file path or http(s):// URL
+ * @param {string} source      - file path or http(s):// URL
+ * @param {number} [timeoutMs] - request timeout in ms (default 15 000); ignored for files
  * @returns {Promise<object>}
  */
-async function loadSpec(source) {
+async function loadSpec(source, timeoutMs = 15_000) {
   let raw;
 
   if (source.startsWith('http://') || source.startsWith('https://')) {
-    const res = await fetch(source, { headers: { Accept: 'application/json, application/yaml, text/yaml' } });
-    if (!res.ok) throw new Error(`Failed to fetch spec from ${source}: HTTP ${res.status}`);
-    raw = await res.text();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(source, {
+        signal: controller.signal,
+        headers: { Accept: 'application/json, application/yaml, text/yaml' },
+      });
+      if (!res.ok) throw new Error(`Failed to fetch spec from ${source}: HTTP ${res.status}`);
+      raw = await res.text();
+    } finally {
+      clearTimeout(timer);
+    }
   } else {
-    raw = readFileSync(resolve(source), 'utf-8');
+    // readFile is non-blocking; readFileSync would block the event loop.
+    raw = await readFile(resolve(source), 'utf-8');
   }
 
   // Try JSON first, fall back to YAML
+  let parsed;
   try {
-    return JSON.parse(raw);
+    parsed = JSON.parse(raw);
   } catch {
-    return yaml.load(raw);
+    parsed = yaml.load(raw);
   }
+
+  // yaml.load('') returns undefined; an empty / non-spec file must not silently
+  // produce an object that causes extractOperations() to throw later.
+  if (!parsed || typeof parsed !== 'object' || !('paths' in parsed)) {
+    throw new Error(
+      `Invalid OpenAPI spec from ${source}: expected an object with a "paths" property`,
+    );
+  }
+  return parsed;
 }
 
 /**
@@ -170,19 +205,21 @@ function operationToFeature(method, apiPath, operation, spec, changeType = 'adde
  * Run OpenAPI discovery. Returns empty array if spec is not configured.
  *
  * @param {object} [options]
- * @param {string} [options.spec]      - path or URL to current spec
- * @param {string} [options.baseSpec]  - path or URL to base spec (diff mode)
+ * @param {string} [options.spec]        - path or URL to current spec
+ * @param {string} [options.baseSpec]    - path or URL to base spec (diff mode)
+ * @param {number} [options.timeoutMs]   - HTTP fetch timeout in ms (default 15 000)
  * @returns {Promise<object[]>}
  */
 export async function discoverFromOpenApi(options = {}) {
   const specSource     = options.spec     ?? process.env.TESTPILOT_OPENAPI_SPEC;
   const baseSpecSource = options.baseSpec ?? process.env.TESTPILOT_OPENAPI_BASE_SPEC;
+  const timeoutMs      = options.timeoutMs ?? 15_000;
 
   if (!specSource) return [];
 
   let currentSpec;
   try {
-    currentSpec = await loadSpec(specSource);
+    currentSpec = await loadSpec(specSource, timeoutMs);
   } catch (err) {
     console.warn(`[discovery/openapi] failed to load spec from ${specSource}: ${err.message}`);
     return [];
@@ -194,7 +231,7 @@ export async function discoverFromOpenApi(options = {}) {
   if (baseSpecSource) {
     let baseSpec;
     try {
-      baseSpec = await loadSpec(baseSpecSource);
+      baseSpec = await loadSpec(baseSpecSource, timeoutMs);
     } catch (err) {
       console.warn(`[discovery/openapi] failed to load base spec: ${err.message} — returning all operations`);
       // Fall through to return all operations
@@ -211,9 +248,10 @@ export async function discoverFromOpenApi(options = {}) {
         // New operation
         features.push(operationToFeature(method, apiPath, operation, currentSpec, 'added'));
       } else {
-        // Check if changed (compare serialised operation — shallow check)
-        const baseSerialized    = JSON.stringify(baseOps.get(key).operation);
-        const currentSerialized = JSON.stringify(operation);
+        // Check if changed. Use stableStringify so key-insertion order from
+        // different parsers/formatters does not produce false "modified" results.
+        const baseSerialized    = stableStringify(baseOps.get(key).operation);
+        const currentSerialized = stableStringify(operation);
         if (baseSerialized !== currentSerialized) {
           features.push(operationToFeature(method, apiPath, operation, currentSpec, 'modified'));
         }
