@@ -109,7 +109,7 @@ router.get('/status/:runId', async (req, res) => {
     scenariosGenerated: run.scenarios_generated,
     testsPassed: run.tests_passed,
     testsFailed: run.tests_failed,
-    errorDetails: run.errorDetails ?? null,
+    errorDetails: run.error_details ?? null,
   });
 });
 

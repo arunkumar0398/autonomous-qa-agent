@@ -1,5 +1,6 @@
 import { getConfig } from '../../config/index.js';
 import { SqliteRepository } from './sqlite.js';
+import { PostgresRepository } from './postgres.js';
 
 /** @type {import('./repository.js').Repository | null} */
 let _repo = null;
@@ -19,10 +20,13 @@ export async function getRepository() {
       break;
     }
     case 'postgres': {
-      // PostgreSQL provider will be added in Phase 3
-      throw new Error(
-        'PostgreSQL provider is not yet implemented. Use "sqlite" for now.',
-      );
+      if (!db.postgresUrl) {
+        throw new Error(
+          'TESTPILOT_POSTGRES_URL env var required when db.provider = "postgres"',
+        );
+      }
+      _repo = new PostgresRepository(db.postgresUrl);
+      break;
     }
     default:
       throw new Error(`Unknown db provider: "${db.provider}"`);

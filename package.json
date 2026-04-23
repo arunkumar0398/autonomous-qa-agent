@@ -7,8 +7,8 @@
   "scripts": {
     "dev": "node --watch src/server.js",
     "start": "node src/server.js",
-    "test": "node --test test/unit/db/sqlite.test.js test/unit/engines/prompt-builder.test.js test/unit/engines/playwright-runner.test.js test/integration/pipeline.test.js",
-    "test:unit": "node --test test/unit/db/sqlite.test.js test/unit/engines/prompt-builder.test.js test/unit/engines/playwright-runner.test.js",
+    "test": "node --test test/unit/db/sqlite.test.js test/unit/db/postgres.test.js test/unit/engines/prompt-builder.test.js test/unit/engines/playwright-runner.test.js test/unit/engines/jira.test.js test/unit/engines/openapi.test.js test/integration/pipeline.test.js",
+    "test:unit": "node --test test/unit/db/sqlite.test.js test/unit/db/postgres.test.js test/unit/engines/prompt-builder.test.js test/unit/engines/playwright-runner.test.js test/unit/engines/jira.test.js test/unit/engines/openapi.test.js",
     "test:integration": "node --test test/integration/pipeline.test.js",
     "check": "node --check src/server.js && node --check src/core/pipeline.js && node --check src/engines/discovery/git-diff.js && node --check src/engines/generator/index.js && node --check src/engines/executor/playwright-runner.js"
   },
@@ -19,8 +19,13 @@
     "@anthropic-ai/sdk": "^0.36.3",
     "@playwright/test": "^1.52.0",
     "express": "^4.19.2",
+    "js-yaml": "^4.1.1",
     "openai": "^6.34.0",
+    "pg": "^8.20.0",
     "simple-git": "^3.36.0",
     "sql.js": "^1.14.1"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.20.0"
   }
 }
