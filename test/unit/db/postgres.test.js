@@ -13,7 +13,7 @@ const SKIP_MSG = 'TESTPILOT_POSTGRES_URL not set — skipping Postgres tests';
 
 describe('PostgresRepository', { skip: skip ? SKIP_MSG : false }, () => {
   let db;
-  // Unique prefix to isolate test data from concurrent runs
+  // Unique prefix isolates this run's rows from concurrent runs
   const prefix = `test_${Date.now()}_`;
 
   before(async () => {
@@ -22,15 +22,43 @@ describe('PostgresRepository', { skip: skip ? SKIP_MSG : false }, () => {
   });
 
   after(async () => {
+    // Clean up all rows created by this test run to keep the DB tidy
+    const client = await db._pool.connect();
+    try {
+      await client.query(
+        `DELETE FROM execution_logs
+           WHERE scenario_id IN (
+             SELECT id FROM test_scenarios WHERE feature_id LIKE $1
+           )`,
+        [`${prefix}%`],
+      );
+      await client.query(
+        'DELETE FROM test_scenarios WHERE feature_id LIKE $1',
+        [`${prefix}%`],
+      );
+      await client.query(
+        'DELETE FROM pipeline_runs WHERE run_id LIKE $1',
+        [`${prefix}%`],
+      );
+      await client.query(
+        'DELETE FROM world_model WHERE page_url LIKE $1',
+        [`${prefix}%`],
+      );
+    } finally {
+      client.release();
+    }
     await db.close();
   });
 
   describe('test_scenarios', () => {
-    test('createScenario — inserts and returns row with id', async () => {
+    test('createScenario — inserts and returns row with parsed JSONB', async () => {
+      const steps = [{ action: 'navigate', target: '/login' }];
+      const tags  = ['auth', 'smoke'];
       const row = await db.createScenario({
         featureId: `${prefix}feature-a`,
         scenarioName: 'PG: user can log in',
-        steps: [{ action: 'navigate', target: '/login' }],
+        steps,
+        tags,
         priority: 'high',
         type: 'happy_path',
       });
@@ -40,6 +68,11 @@ describe('PostgresRepository', { skip: skip ? SKIP_MSG : false }, () => {
       assert.equal(row.scenario_name, 'PG: user can log in');
       assert.equal(row.priority, 'high');
       assert.equal(row.status, 'active');
+      // pg deserialises JSONB — assert JS array, not string
+      assert.ok(Array.isArray(row.steps), 'steps should be JS array');
+      assert.deepEqual(row.steps, steps);
+      assert.ok(Array.isArray(row.tags), 'tags should be JS array');
+      assert.deepEqual(row.tags, tags);
     });
 
     test('getScenariosByFeature — returns matching active scenarios', async () => {
@@ -52,6 +85,7 @@ describe('PostgresRepository', { skip: skip ? SKIP_MSG : false }, () => {
       const rows = await db.getScenariosByFeature(`${prefix}feature-b`);
       assert.ok(rows.length >= 1);
       assert.ok(rows.every((r) => r.feature_id === `${prefix}feature-b`));
+      assert.ok(rows.every((r) => Array.isArray(r.steps)), 'steps should be JS arrays');
     });
 
     test('updateScenario — updates allowed fields', async () => {
@@ -64,13 +98,16 @@ describe('PostgresRepository', { skip: skip ? SKIP_MSG : false }, () => {
       const updated = await db.updateScenario(created.id, {
         scenarioName: 'After',
         priority: 'low',
+        steps: [{ action: 'click', target: '#btn' }],
       });
 
       assert.equal(updated.scenario_name, 'After');
       assert.equal(updated.priority, 'low');
+      assert.ok(Array.isArray(updated.steps), 'updated steps should be JS array');
+      assert.deepEqual(updated.steps, [{ action: 'click', target: '#btn' }]);
     });
 
-    test('getAllScenarios — returns active scenarios', async () => {
+    test('getAllScenarios — returns active scenarios array', async () => {
       const all = await db.getAllScenarios();
       assert.ok(Array.isArray(all));
     });
@@ -88,14 +125,17 @@ describe('PostgresRepository', { skip: skip ? SKIP_MSG : false }, () => {
         scenarioId: scenario.id,
         status: 'passed',
         durationMs: 999,
+        errorDetails: { msg: 'none' },
       });
 
       assert.equal(Number(log.scenario_id), scenario.id);
       assert.equal(log.status, 'passed');
       assert.equal(log.duration_ms, 999);
+      // JSONB error_details returned as object
+      assert.deepEqual(log.error_details, { msg: 'none' });
     });
 
-    test('getExecutionLogs — returns logs for scenario', async () => {
+    test('getExecutionLogs — returns logs for scenario ordered desc', async () => {
       const scenario = await db.createScenario({
         featureId: `${prefix}logs2`,
         scenarioName: 'PG: logs2',
@@ -129,11 +169,14 @@ describe('PostgresRepository', { skip: skip ? SKIP_MSG : false }, () => {
         scenariosGenerated: 7,
         testsPassed: 6,
         testsFailed: 1,
+        errorDetails: { reason: 'timeout' },
       });
 
       assert.equal(updated.status, 'completed');
       assert.equal(updated.features_found, 3);
       assert.equal(updated.tests_passed, 6);
+      // JSONB error_details returned as object
+      assert.deepEqual(updated.error_details, { reason: 'timeout' });
     });
 
     test('getPipelineRun — returns run by runId', async () => {
@@ -141,16 +184,17 @@ describe('PostgresRepository', { skip: skip ? SKIP_MSG : false }, () => {
       await db.createPipelineRun({ runId, trigger: 'webhook', status: 'pending' });
       const run = await db.getPipelineRun(runId);
       assert.equal(run.run_id, runId);
+      assert.equal(run.trigger, 'webhook');
     });
 
-    test('listPipelineRuns — returns array', async () => {
+    test('listPipelineRuns — returns ordered array', async () => {
       const runs = await db.listPipelineRuns(50);
       assert.ok(Array.isArray(runs));
     });
   });
 
   describe('world_model', () => {
-    test('upsertWorldModel — insert then update', async () => {
+    test('upsertWorldModel — insert then update, returns parsed JSONB', async () => {
       const url = `${prefix}/dashboard`;
 
       await db.upsertWorldModel({
@@ -166,11 +210,24 @@ describe('PostgresRepository', { skip: skip ? SKIP_MSG : false }, () => {
       });
 
       assert.equal(row.page_url, url);
+      assert.ok(Array.isArray(row.elements), 'elements should be JS array');
+      assert.equal(row.elements.length, 2);
+      assert.ok(Array.isArray(row.flows), 'flows should be JS array');
     });
 
     test('getWorldModel — returns array', async () => {
       const model = await db.getWorldModel();
       assert.ok(Array.isArray(model));
+    });
+  });
+
+  describe('pre-init guard', () => {
+    test('calling _all before initialize() throws helpful error', async () => {
+      const uninit = new PostgresRepository(PG_URL);
+      await assert.rejects(
+        () => uninit._all('SELECT 1'),
+        /not initialised/,
+      );
     });
   });
 });

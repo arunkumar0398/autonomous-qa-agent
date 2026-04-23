@@ -3,67 +3,66 @@ import { Repository } from './repository.js';
 
 const { Pool } = pg;
 
-const MIGRATIONS = `
-CREATE TABLE IF NOT EXISTS test_scenarios (
-  id          SERIAL PRIMARY KEY,
-  feature_id  TEXT NOT NULL,
-  scenario_name TEXT NOT NULL,
-  description TEXT,
-  priority    TEXT CHECK (priority IN ('high','medium','low')) DEFAULT 'medium',
-  type        TEXT CHECK (type IN ('happy_path','edge_case','negative','regression')) DEFAULT 'happy_path',
-  steps       JSONB NOT NULL DEFAULT '[]',
-  status      TEXT DEFAULT 'active',
-  last_run    TIMESTAMPTZ,
-  failure_count INTEGER DEFAULT 0,
-  tags        JSONB DEFAULT '[]',
-  created_at  TIMESTAMPTZ DEFAULT now(),
-  updated_at  TIMESTAMPTZ DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS world_model (
-  id           SERIAL PRIMARY KEY,
-  page_url     TEXT UNIQUE,
-  elements     JSONB,
-  flows        JSONB,
-  last_updated TIMESTAMPTZ
-);
-
-CREATE TABLE IF NOT EXISTS execution_logs (
-  id             SERIAL PRIMARY KEY,
-  scenario_id    INTEGER REFERENCES test_scenarios(id),
-  run_at         TIMESTAMPTZ DEFAULT now(),
-  status         TEXT,
-  screenshot_url TEXT,
-  error_details  JSONB,
-  duration_ms    INTEGER
-);
-
-CREATE TABLE IF NOT EXISTS pipeline_runs (
-  id                  SERIAL PRIMARY KEY,
-  run_id              TEXT UNIQUE NOT NULL,
-  trigger             TEXT,
-  status              TEXT DEFAULT 'pending',
-  started_at          TIMESTAMPTZ DEFAULT now(),
-  completed_at        TIMESTAMPTZ,
-  features_found      INTEGER DEFAULT 0,
-  scenarios_generated INTEGER DEFAULT 0,
-  tests_passed        INTEGER DEFAULT 0,
-  tests_failed        INTEGER DEFAULT 0,
-  error_details       JSONB,
-  options             JSONB
-);
-
-CREATE INDEX IF NOT EXISTS idx_test_scenarios_feature_id ON test_scenarios(feature_id);
-CREATE INDEX IF NOT EXISTS idx_test_scenarios_status     ON test_scenarios(status);
-CREATE INDEX IF NOT EXISTS idx_execution_logs_scenario   ON execution_logs(scenario_id);
-CREATE INDEX IF NOT EXISTS idx_pipeline_runs_run_id      ON pipeline_runs(run_id);
-CREATE INDEX IF NOT EXISTS idx_pipeline_runs_status      ON pipeline_runs(status);
-`;
+// Each statement in its own string so we can run them inside a transaction
+// individually. Multi-statement batches are not atomic in pg.
+const MIGRATION_STATEMENTS = [
+  `CREATE TABLE IF NOT EXISTS test_scenarios (
+    id            SERIAL PRIMARY KEY,
+    feature_id    TEXT NOT NULL,
+    scenario_name TEXT NOT NULL,
+    description   TEXT,
+    priority      TEXT CHECK (priority IN ('high','medium','low')) DEFAULT 'medium',
+    type          TEXT CHECK (type IN ('happy_path','edge_case','negative','regression')) DEFAULT 'happy_path',
+    steps         JSONB NOT NULL DEFAULT '[]',
+    status        TEXT DEFAULT 'active',
+    last_run      TIMESTAMPTZ,
+    failure_count INTEGER DEFAULT 0,
+    tags          JSONB DEFAULT '[]',
+    created_at    TIMESTAMPTZ DEFAULT now(),
+    updated_at    TIMESTAMPTZ DEFAULT now()
+  )`,
+  `CREATE TABLE IF NOT EXISTS world_model (
+    id           SERIAL PRIMARY KEY,
+    page_url     TEXT UNIQUE,
+    elements     JSONB,
+    flows        JSONB,
+    last_updated TIMESTAMPTZ
+  )`,
+  `CREATE TABLE IF NOT EXISTS execution_logs (
+    id             SERIAL PRIMARY KEY,
+    scenario_id    INTEGER REFERENCES test_scenarios(id),
+    run_at         TIMESTAMPTZ DEFAULT now(),
+    status         TEXT,
+    screenshot_url TEXT,
+    error_details  JSONB,
+    duration_ms    INTEGER
+  )`,
+  `CREATE TABLE IF NOT EXISTS pipeline_runs (
+    id                  SERIAL PRIMARY KEY,
+    run_id              TEXT UNIQUE NOT NULL,
+    trigger             TEXT,
+    status              TEXT DEFAULT 'pending',
+    started_at          TIMESTAMPTZ DEFAULT now(),
+    completed_at        TIMESTAMPTZ,
+    features_found      INTEGER DEFAULT 0,
+    scenarios_generated INTEGER DEFAULT 0,
+    tests_passed        INTEGER DEFAULT 0,
+    tests_failed        INTEGER DEFAULT 0,
+    error_details       JSONB,
+    options             JSONB
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_test_scenarios_feature_id  ON test_scenarios(feature_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_test_scenarios_status      ON test_scenarios(status)`,
+  `CREATE INDEX IF NOT EXISTS idx_execution_logs_scenario_id ON execution_logs(scenario_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_pipeline_runs_run_id       ON pipeline_runs(run_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_pipeline_runs_status       ON pipeline_runs(status)`,
+];
 
 /**
  * PostgreSQL repository using node-postgres connection pool.
  *
- * Connection string read from constructor arg or TESTPILOT_POSTGRES_URL env var.
+ * Pass the postgres:// connection string as the first constructor argument.
+ * The factory in db/index.js reads TESTPILOT_POSTGRES_URL and passes it here.
  */
 export class PostgresRepository extends Repository {
   /**
@@ -85,10 +84,24 @@ export class PostgresRepository extends Repository {
       connectionTimeoutMillis: this._poolOptions.connectionTimeoutMillis ?? 5_000,
     });
 
-    // Validate connectivity
+    // Surface idle-client errors instead of crashing the process with an
+    // unhandled 'error' event on the Pool EventEmitter.
+    this._pool.on('error', (err) => {
+      console.error('[PostgresRepository] idle client error:', err.message);
+    });
+
+    // Run each DDL statement inside a single transaction so the schema is
+    // applied atomically. IF NOT EXISTS guards make re-runs safe.
     const client = await this._pool.connect();
     try {
-      await client.query(MIGRATIONS);
+      await client.query('BEGIN');
+      for (const stmt of MIGRATION_STATEMENTS) {
+        await client.query(stmt);
+      }
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
     } finally {
       client.release();
     }
@@ -103,24 +116,32 @@ export class PostgresRepository extends Repository {
 
   /* ---- helpers ---- */
 
+  _assertReady() {
+    if (!this._pool) {
+      throw new Error('PostgresRepository not initialised — call initialize() first');
+    }
+  }
+
   /**
-   * Execute a query and return all rows.
+   * Execute a SELECT and return all rows.
    * @param {string} sql
    * @param {Array} [params]
    * @returns {Promise<object[]>}
    */
   async _all(sql, params = []) {
+    this._assertReady();
     const { rows } = await this._pool.query(sql, params);
     return rows;
   }
 
   /**
-   * Execute a query and return first row or null.
+   * Execute a SELECT and return first row or null.
    * @param {string} sql
    * @param {Array} [params]
    * @returns {Promise<object|null>}
    */
   async _get(sql, params = []) {
+    this._assertReady();
     const { rows } = await this._pool.query(sql, params);
     return rows[0] ?? null;
   }
@@ -129,9 +150,10 @@ export class PostgresRepository extends Repository {
    * Execute a mutating query (INSERT/UPDATE) with RETURNING *.
    * @param {string} sql
    * @param {Array} [params]
-   * @returns {Promise<object>} first returned row
+   * @returns {Promise<object|null>} first returned row
    */
   async _run(sql, params = []) {
+    this._assertReady();
     const { rows } = await this._pool.query(sql, params);
     return rows[0] ?? null;
   }
@@ -139,6 +161,7 @@ export class PostgresRepository extends Repository {
   /* ---- test_scenarios ---- */
 
   async createScenario(scenario) {
+    // Pass JS values directly — pg serialises JSONB columns automatically.
     return this._run(
       `INSERT INTO test_scenarios
          (feature_id, scenario_name, description, priority, type, steps, status, tags)
@@ -150,9 +173,9 @@ export class PostgresRepository extends Repository {
         scenario.description ?? null,
         scenario.priority ?? 'medium',
         scenario.type ?? 'happy_path',
-        JSON.stringify(scenario.steps ?? []),
+        scenario.steps ?? [],
         scenario.status ?? 'active',
-        JSON.stringify(scenario.tags ?? []),
+        scenario.tags ?? [],
       ],
     );
   }
@@ -183,17 +206,16 @@ export class PostgresRepository extends Repository {
 
     for (const [jsKey, dbCol] of Object.entries(mapping)) {
       if (updates[jsKey] !== undefined) {
-        let val = updates[jsKey];
-        if (dbCol === 'steps' || dbCol === 'tags') val = JSON.stringify(val);
+        // Pass JSONB columns as raw JS values — pg handles serialisation.
         sets.push(`${dbCol} = $${idx++}`);
-        values.push(val);
+        values.push(updates[jsKey]);
       }
     }
     if (sets.length === 0) {
       return this._get('SELECT * FROM test_scenarios WHERE id = $1', [id]);
     }
 
-    sets.push(`updated_at = now()`);
+    sets.push('updated_at = now()');
     values.push(id);
     return this._run(
       `UPDATE test_scenarios SET ${sets.join(', ')} WHERE id = $${idx} RETURNING *`,
@@ -217,7 +239,7 @@ export class PostgresRepository extends Repository {
         log.scenarioId,
         log.status,
         log.screenshotUrl ?? null,
-        log.errorDetails ? JSON.stringify(log.errorDetails) : null,
+        log.errorDetails ?? null,   // JSONB — pass object directly
         log.durationMs ?? null,
       ],
     );
@@ -243,8 +265,8 @@ export class PostgresRepository extends Repository {
        RETURNING *`,
       [
         page.pageUrl,
-        page.elements ? JSON.stringify(page.elements) : null,
-        page.flows    ? JSON.stringify(page.flows)    : null,
+        page.elements ?? null,   // JSONB — pass object directly
+        page.flows    ?? null,
       ],
     );
   }
@@ -264,7 +286,7 @@ export class PostgresRepository extends Repository {
         run.runId,
         run.trigger ?? 'api',
         run.status  ?? 'pending',
-        run.options ? JSON.stringify(run.options) : null,
+        run.options ?? null,   // JSONB — pass object directly
       ],
     );
   }
@@ -286,10 +308,9 @@ export class PostgresRepository extends Repository {
 
     for (const [jsKey, dbCol] of Object.entries(mapping)) {
       if (updates[jsKey] !== undefined) {
-        let val = updates[jsKey];
-        if (dbCol === 'error_details' && val && typeof val === 'object') val = JSON.stringify(val);
+        // error_details is JSONB — pass object directly.
         sets.push(`${dbCol} = $${idx++}`);
-        values.push(val);
+        values.push(updates[jsKey]);
       }
     }
     if (sets.length === 0) {
