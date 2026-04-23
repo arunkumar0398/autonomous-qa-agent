@@ -14,7 +14,9 @@ const SKIP_MSG = 'TESTPILOT_POSTGRES_URL not set — skipping Postgres tests';
 describe('PostgresRepository', { skip: skip ? SKIP_MSG : false }, () => {
   let db;
   // Unique prefix isolates this run's rows from concurrent runs
-  const prefix = `test_${Date.now()}_`;
+  // Use hyphens, not underscores: '_' is a single-char SQL LIKE wildcard so
+  // 'test_…%' could match unrelated rows in a shared database.
+  const prefix = `test-${Date.now()}-`;
 
   before(async () => {
     db = new PostgresRepository(PG_URL);
